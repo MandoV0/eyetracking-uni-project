@@ -1,168 +1,246 @@
-from pathlib import Path
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import classification_report, confusion_matrix
 
-"""
-PIPELINE:
-raw signals
-=> rule-based labeling (pseudo ground truth as we are missing necessary labels for training)
-=> windowed feature extraction
-=> Random Forest (3-classes, Attentive, Inattentive, Aggresive)
-"""
+class DriverBehaviorClassifier:
+    def __init__(self, n_estimators=100, max_depth=10, random_state=42):
+        self.model = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, max_depth=max_depth)
+        self.feature_columns = []
+        
+    def load_data(self, filepath):
+        print(f"Loading data from {filepath}...")
+        df = pd.read_csv(filepath)
+        print(f"Loaded {len(df)} rows with {len(df.columns)} columns")
+        return df
+    
+    def engineer_features(self, df, window_size=50):
+        """
+        Engineer features from raw sensor data using rolling windows
+        window_size: number of rows for rolling calculations. (Calculate the mean,min,max.... inside these windows as behaviour isnt instantanious)
+        """
+        print("Engineering features...")
+        features = pd.DataFrame()
+        
+        features['time'] = df['time']
+        
+        # ---- AGGRESSIVE DRIVING ----
+        # Acceleration metrics
+        features['accel_long_mean'] = df['oveBodyAccelerationLongitudinalX'].rolling(window_size, min_periods=1).mean()
+        features['accel_long_std'] = df['oveBodyAccelerationLongitudinalX'].rolling(window_size, min_periods=1).std()
+        features['accel_long_max'] = df['oveBodyAccelerationLongitudinalX'].rolling(window_size, min_periods=1).max()
+        features['accel_lat_std'] = df['oveBodyAccelerationLateralY'].rolling(window_size, min_periods=1).std()
+        
+        # Jerk metrics (how fast f acceleration changes)
+        features['jerk_long_mean'] = df['oveBodyJerkLongitudinalX'].rolling(window_size, min_periods=1).mean().abs()
+        features['jerk_long_max'] = df['oveBodyJerkLongitudinalX'].rolling(window_size, min_periods=1).max().abs()
+        features['jerk_lat_std'] = df['oveBodyJerkLateralY'].rolling(window_size, min_periods=1).std()
+        
+        # Speed and throttle
+        features['speed'] = np.sqrt(df['oveBodyVelocityX']**2 + df['oveBodyVelocityY']**2)
+        features['speed_std'] = features['speed'].rolling(window_size, min_periods=1).std()
+        features['throttle_mean'] = df['throttle'].rolling(window_size, min_periods=1).mean()
+        features['throttle_changes'] = df['throttle'].diff().abs().rolling(window_size, min_periods=1).sum()
+        
+        # Steering aggressiveness
+        features['steering_angle_std'] = df['steeringWheelAngle'].rolling(window_size, min_periods=1).std()
+        features['steering_rate'] = df['steeringWheelAngle'].diff().abs().rolling(window_size, min_periods=1).mean()
+        features['yaw_velocity_std'] = df['oveYawVelocity'].rolling(window_size, min_periods=1).std()
+        
+        # Headway (distance to car in front)
+        if 'aheadTHW' in df.columns:
+            features['thw_mean'] = df['aheadTHW'].replace(-1, np.nan).rolling(window_size, min_periods=1).mean()
+            features['short_headway_ratio'] = (df['aheadTHW'].rolling(window_size, min_periods=1).apply(
+                lambda x: (((x > 0) & (x < 2)).sum() / len(x)) if len(x) > 0 else 0
+            ))
+        
+        # Brake usage
+        if 'brakePedalActive' in df.columns:
+            features['brake_frequency'] = df['brakePedalActive'].rolling(window_size, min_periods=1).sum()
+        
+        # ----- INATTENTIVE DRIVING -----
+        # Lane position variability
+        features['lateral_pos_std'] = df['ovePositionLateralR'].rolling(window_size, min_periods=1).std()
+        features['lateral_pos_mean'] = df['ovePositionLateralR'].rolling(window_size, min_periods=1).mean().abs()
+        
+        # NDRT (Non driving related tasks) performance
+        if 'arrowsWrongCount' in df.columns:
+            features['ndrt_error_rate'] = (df['arrowsWrongCount'] + df['arrowsTimeoutCount']).rolling(window_size, min_periods=1).mean()
+            features['ndrt_total_attempts'] = (df['arrowsCorrectCount'] + df['arrowsWrongCount'] + df['arrowsTimeoutCount']).rolling(window_size, min_periods=1).sum()
+        
+        # Eye gaze features
+        # TODO: Fine tune the angles
+        if 'openxrGazeHeading' in df.columns:
+            # Off-road
+            features['gaze_heading_abs'] = df['openxrGazeHeading'].abs()
+            features['gaze_pitch_abs'] = df['openxrGazePitch'].abs()
+            features['gaze_off_road'] = ((df['openxrGazeHeading'].abs() > 30) | 
+                                          (df['openxrGazePitch'].abs() > 20)).astype(int)
+            features['gaze_off_road_ratio'] = features['gaze_off_road'].rolling(window_size, min_periods=1).mean()
+        
+        # Eyelid opening to detect if the driver is drowsiness (sleepy), could maybe pair this with the hearbeat later? TODO
+        if 'varjoEyelidOpening' in df.columns:
+            features['eyelid_mean'] = df['varjoEyelidOpening'].rolling(window_size, min_periods=1).mean()
+            features['eyelid_low_ratio'] = (df['varjoEyelidOpening'] < 0.3).rolling(window_size, min_periods=1).mean()
+        
+        # If the driver is Attentive he should be driving pretty smoothly.
+        features['control_smoothness'] = 1 / (1 + features['steering_rate'] + features['throttle_changes'] / 10)
+        
+        # Fill NaN values with next or previous valid value.
+        # Example: [NaN, 3, 5] -> [3, 3, 5]
+        features = features.fillna(method='bfill').fillna(method='ffill').fillna(0)
+        
+        return features
+    
+    def generate_labels(self, features):
+        """
+        Generate pseudo-labels based on heuristic rules
+        Returns: labels (Attentive=0, Inattentive=1, Aggressive=2)
+        """
+        print("Generating rule-based labels...")
+        
+        # Normalize features for scoring (0 - 1 scale) so we can compare them to eachother
+        def normalize(series):
+            return (series - series.min()) / (series.max() - series.min() + 1e-10) # 1e-10 to avoid possible division by zero, so we are just adding a tiny number.
+        
+        # TODO: Fine tune the weights
+        # AGGRESSION SCORE
+        aggression_score = (
+            normalize(features['accel_long_std']) * 0.15 +
+            normalize(features['jerk_long_max']) * 0.20 +
+            normalize(features['jerk_lat_std']) * 0.15 +
+            normalize(features['speed_std']) * 0.10 +
+            normalize(features['steering_angle_std']) * 0.15 +
+            normalize(features['steering_rate']) * 0.15 +
+            normalize(features['throttle_changes']) * 0.10
+        )
+        
+        # Add headway if available
+        if 'short_headway_ratio' in features.columns:
+            print("Added Headway")
+            aggression_score += normalize(features['short_headway_ratio']) * 0.10
+        
+        # INATTENTION SCORE
+        inattention_score = (
+            normalize(features['lateral_pos_std']) * 0.20
+        )
+        
+        if 'ndrt_error_rate' in features.columns:
+            inattention_score += normalize(features['ndrt_error_rate']) * 0.25
+        
+        if 'gaze_off_road_ratio' in features.columns:
+            inattention_score += normalize(features['gaze_off_road_ratio']) * 0.30
+        
+        if 'eyelid_low_ratio' in features.columns:
+            inattention_score += normalize(features['eyelid_low_ratio']) * 0.15
+        
+        # Low control smoothness indicates inattention.
+        inattention_score += normalize(1 - features['control_smoothness']) * 0.10
+        
+        # CLASSIFICATION LOGIC
+        # Use percentile based thresholds.
+        # TODO: Fine tune the treshold
+        agg_threshold_high = np.percentile(aggression_score, 70)
+        inatt_threshold_high = np.percentile(inattention_score, 70)
+        
+        labels = np.zeros(len(features), dtype=int)  # Default: Attentive
+        
+        # If both scores are high, aggressive is choosen as aggressive driving is more dangerous
+        labels[(aggression_score > agg_threshold_high) & (inattention_score <= inatt_threshold_high)] = 2   # Aggressive
+        labels[(inattention_score > inatt_threshold_high) & (aggression_score <= agg_threshold_high)] = 1   # Inattentive
+        labels[(aggression_score > agg_threshold_high) & (inattention_score > inatt_threshold_high)] = 2    # Aggressive
+        
+        # Store scores for analysis
+        features['aggression_score'] = aggression_score
+        features['inattention_score'] = inattention_score
+        
+        label_counts = pd.Series(labels).value_counts()
+        print(f"\nLabel distribution:")
+        print(f"  Attentive (0): {label_counts.get(0, 0)} ({label_counts.get(0, 0) / len(labels) * 100:.1f}%)")
+        print(f"  Inattentive (1): {label_counts.get(1, 0)} ({label_counts.get(1, 0) / len(labels) * 100:.1f}%)")
+        print(f"  Aggressive (2): {label_counts.get(2, 0)} ({label_counts.get(2, 0) / len(labels) * 100:.1f}%)")
+        
+        # TODO: Use a Hidden Markov Model to create the labels using the weights
 
-# CONFIG
-EGO_DATA_DIR = Path("data/VTI/T3.2/Ego vehicle data").resolve()
-WINDOW = 250  # 5 seconds @ 50 Hz
-RANDOM_STATE = 42
+        return labels
+    
+    """
+    Removes columns not used for training
+    """
+    def prepare_training_data(self, features, labels):
+        exclude_cols = ['time', 'aggression_score', 'inattention_score']
+        X = features.drop(columns=[col for col in exclude_cols if col in features.columns])
+        self.feature_columns = X.columns.tolist()
+        return X, labels
+    
+    def train(self, X, y):
+        print("\n\n Training Random Forest classifier...")
+        
+        # Split data into train/test samples.
+        # TODO: Use all available files for training/testing 
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y) # Stratify preservers propotions of the labels for the split.
+        
+        self.model.fit(X_train, y_train)
+        
+        train_score = self.model.score(X_train, y_train)
+        test_score = self.model.score(X_test, y_test)
+        
+        print(f"Training accuracy   :      {train_score:.3f}")
+        print(f"Testing accuracy    :      {test_score:.3f}")
 
-# DATA LOADING
-def read_data() -> pd.DataFrame:
-    csv_files = list(EGO_DATA_DIR.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError("No CSV files found in Ego vehicle data directory")
-    return pd.read_csv(csv_files[0])
+        cv_scores = cross_val_score(self.model, X, y, cv=5)
+        print(f"Cross-validation accuracy: {cv_scores.mean():.3f} (+/- {cv_scores.std():.3f})")
+        
+        y_pred = self.model.predict(X_test)
+        
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred, target_names=['Attentive', 'Inattentive', 'Aggressive']))
+        
+        print("\nConfusion Matrix:")
+        print(confusion_matrix(y_test, y_pred))
+        
+        feature_importance = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        print("\nTop 10 Most Important Features:")
+        print(feature_importance.head(10).to_string(index=False))
+        
+        return X_train, X_test, y_train, y_test, y_pred
+    
+    """
+    Predict models performance on testing/new data.
+    """
+    def predict(self, features):
+        X = features[self.feature_columns]
+        return self.model.predict(X)
+    
+    def run_pipeline(self, filepath, window_size=50):
+        df = self.load_data(filepath)
+        features = self.engineer_features(df, window_size)
+        labels = self.generate_labels(features)
+        X, y = self.prepare_training_data(features, labels)
+        
+        results = self.train(X, y)
+        
+        return features, labels, results
 
-# CLEANING
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+if __name__ == "__main__":
+    classifier = DriverBehaviorClassifier()
 
-    # Fix sentinel values
-    if "aheadTHW" in df.columns:
-        df["aheadTHW"] = df["aheadTHW"].replace(-1, 100.0)
-
-    # Drop rows only if critical signals are missing
-    df = df.dropna(subset=[
-        "oveBodyVelocityX",
-        "oveBodyAccelerationLongitudinalX",
-        "steeringWheelAngle",
-        "aheadTHW"
-    ])
-
-    return df
-
-# RULE-BASED LABELING
-def create_labels(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["Label"] = "Attentive"
-
-    # INATTENTION (based on duration)
-    ON_ROAD = df["openxrGazeWorldModel"].isin(["Road", "Windshield"])
-    OFF_ROAD = ~ON_ROAD # On Road is a boolean series, ~ to invert
-
-    # Count consecutive off road samples
-    df["off_road_run"] = (
-        OFF_ROAD
-        .astype(int)
-        .groupby((~OFF_ROAD).cumsum())
-        .cumsum()
-    )
-
-    # >= 2 seconds 50 Hz
-    inattentive_mask = df["off_road_run"] >= 100 # How long are we looking of road? 2 seconds => Innatentive
-    df.loc[inattentive_mask, "Label"] = "Inattentive"
-
-    # AGGRESSION (physics/speed based)
-    aggressive_mask = (
-        (df["oveBodyAccelerationLongitudinalX"] < -3.5) | # Harsh breaking - 3.5m/s
-        (df["oveBodyJerkLongitudinalX"].abs() > 5.0) |    # Jerk is sudden movement
-        (df["aheadTHW"] < 0.6) |                          # Tailgaiting
-        ((df["brakePedalActive"] == True) & (df["brakeForce"] > 0.7))
-    )
-
-    # Aggressive overrides inattentive behavior
-    df.loc[aggressive_mask, "Label"] = "Aggressive"
+    # TODO: Use all data for training/testing instead of a single csv file.
+    filepath = "data/VTI/T3.2/Ego vehicle data/i4driving_roadA_db_fp03_roadA_fp3_1710765373441.csv"
+    
+    features, labels, results = classifier.run_pipeline(filepath, window_size=50)
+        
+    print("\n\n\nModel training complete")
+    # TODO: Visualizations of data and model performance. (Also for the confusion matrix)
+    # TODO: Add Physiology data to the algorithm. High heart beat could indicate risky/aggresive driving
+    # TODO: Test with different estimators and depth.
 
     """
-    Maybe add Indicator
+    Currently it seems like the model is not learning any patters it seems like its learning the labeling rules making the accuracy "too" high.
+    So a HMM will probably perform better.
     """
-
-    return df
-
-
-# MAIN PIPELINE
-
-# 1. Load
-df = read_data()
-
-# 2. Clean
-df = clean_data(df)
-
-# 3. Create labels
-df = create_labels(df)
-
-# 4. Encode labels as numbers for Random Forest
-label_map = {
-    "Attentive": 0,
-    "Inattentive": 1,
-    "Aggressive": 2
-}
-df["label"] = df["Label"].map(label_map)
-
-print("Label distribution (raw samples):")
-print(df["Label"].value_counts(), "\n")
-
-# FEATURE WINDOWING
-
-features = df.rolling(WINDOW).agg({
-    "oveBodyVelocityX": ["mean", "std"],
-    "oveBodyAccelerationLongitudinalX": ["min", "max", "std"],
-    "steeringWheelAngle": ["std"],
-    "aheadTHW": ["min"]
-})
-
-# Flatten column names
-features.columns = ["_".join(col) for col in features.columns]
-
-# Window label = majority class
-features["label"] = (
-    df["label"]
-    .rolling(WINDOW)
-    .apply(lambda x: x.mode().iloc[0])
-)
-
-features.dropna(inplace=True)
-
-print("Label distribution (windows):")
-print(features["label"].value_counts(), "\n")
-
-# TRAIN RANDOM FOREST
-
-X = features.drop(columns="label")
-y = features["label"]
-
-# train_test_split()
-
-rf = RandomForestClassifier(
-    n_estimators=300,
-    max_depth=15,
-    min_samples_leaf=20,
-    class_weight="balanced",
-    random_state=RANDOM_STATE,
-    n_jobs=-1 # Parallel Processing for faster training, should use all cpu cores
-)
-
-rf.fit(X, y)
-
-print("Random Forest trained")
-
-# FEATURE IMPORTANCE
-
-importance = pd.Series(
-    rf.feature_importances_,
-    index=X.columns
-).sort_values(ascending=False)
-
-print("\nFeature importance:")
-print(importance)
-
-
-
-
-
-
-
-
-
-
-
