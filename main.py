@@ -4,16 +4,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix
 
+from data_merger import load_csv, execute
+
 class DriverBehaviorClassifier:
-    def __init__(self, n_estimators=100, max_depth=10, random_state=42):
-        self.model = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, max_depth=max_depth)
+    def __init__(self, n_estimators=100, max_depth=10, min_samples_leaf=1, random_state=42):
+        self.model = RandomForestClassifier(n_estimators=n_estimators, min_samples_leaf=min_samples_leaf, max_depth=max_depth, random_state=random_state)
         self.feature_columns = []
-        
-    def load_data(self, filepath):
-        print(f"Loading data from {filepath}...")
-        df = pd.read_csv(filepath)
-        print(f"Loaded {len(df)} rows with {len(df.columns)} columns")
-        return df
     
     def engineer_features(self, df, window_size=50):
         """
@@ -38,7 +34,7 @@ class DriverBehaviorClassifier:
         features['jerk_lat_std'] = df['oveBodyJerkLateralY'].rolling(window_size, min_periods=1).std()
         
         # Speed and throttle
-        features['speed'] = np.sqrt(df['oveBodyVelocityX']**2 + df['oveBodyVelocityY']**2)
+        features['speed'] = np.sqrt(df['oveBodyVelocityX'] ** 2 + df['oveBodyVelocityY']**2)
         features['speed_std'] = features['speed'].rolling(window_size, min_periods=1).std()
         features['throttle_mean'] = df['throttle'].rolling(window_size, min_periods=1).mean()
         features['throttle_changes'] = df['throttle'].diff().abs().rolling(window_size, min_periods=1).sum()
@@ -217,23 +213,26 @@ class DriverBehaviorClassifier:
         X = features[self.feature_columns]
         return self.model.predict(X)
     
-    def run_pipeline(self, filepath, window_size=50):
-        df = self.load_data(filepath)
+    def run_pipeline(self, df: pd.DataFrame, window_size=50):
         features = self.engineer_features(df, window_size)
         labels = self.generate_labels(features)
         X, y = self.prepare_training_data(features, labels)
         
         results = self.train(X, y)
-        
+        print ("\n\n----- Done -----\n\n")
         return features, labels, results
 
+class DataCleaner:
+    """
+    The purpose of this class is:
+    - Entfernen fehlerhafter Messwerte (Outlier Detection, Sensorfehler)
+    - Glättung und Noise-Reduction mittels Filterverfahren
+    """
+
 if __name__ == "__main__":
-    classifier = DriverBehaviorClassifier()
+    
 
     # TODO: Use all data for training/testing instead of a single csv file.
-    filepath = "data/VTI/T3.2/Ego vehicle data/i4driving_roadA_db_fp03_roadA_fp3_1710765373441.csv"
-    
-    features, labels, results = classifier.run_pipeline(filepath, window_size=50)
         
     print("\n\n\nModel training complete")
     # TODO: Visualizations of data and model performance. (Also for the confusion matrix)
@@ -244,3 +243,10 @@ if __name__ == "__main__":
     Currently it seems like the model is not learning any patters it seems like its learning the labeling rules making the accuracy "too" high.
     So a HMM will probably perform better.
     """
+
+    default_merge   = execute(interpolation_mode=0)
+    # linear_sync     = execute(interpolation_mode=1)
+    # spline_sync     = execute(interpolation_mode=1)
+
+    classifier = DriverBehaviorClassifier(max_depth=5, min_samples_leaf=5)
+    features, labels, results = classifier.run_pipeline(default_merge, window_size=50)
