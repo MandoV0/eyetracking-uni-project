@@ -4,14 +4,15 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix
 
-from data_merger import load_csv, execute
+from DataProcessor import load_csv, execute
 
 class DriverBehaviorClassifier:
-    def __init__(self, n_estimators=100, max_depth=10, min_samples_leaf=1, random_state=42):
+    def __init__(self, n_estimators=100, max_depth=10, min_samples_leaf=1, random_state=42, use_phys=True):
         self.model = RandomForestClassifier(n_estimators=n_estimators, min_samples_leaf=min_samples_leaf, max_depth=max_depth, random_state=random_state)
         self.feature_columns = []
+        self.use_phys = use_phys
     
-    def engineer_features(self, df, window_size=50):
+    def engineer_features(self, df, window_size=50, use_phys=True):
         """
         Engineer features from raw sensor data using rolling windows
         window_size: number of rows for rolling calculations. (Calculate the mean,min,max.... inside these windows as behaviour isnt instantanious)
@@ -82,11 +83,32 @@ class DriverBehaviorClassifier:
         
         # If the driver is Attentive he should be driving pretty smoothly.
         features['control_smoothness'] = 1 / (1 + features['steering_rate'] + features['throttle_changes'] / 10)
+
+        if use_phys:
+            if 'heartRate' in df.columns:
+                # 1. Stress Level (Mean HR)
+                features['hr_mean'] = df['heartRate'].rolling(window_size, min_periods=1).mean()
+                
+                # 2. Stress Response (HR Change)
+                # How much the heart rate is jumping up/down
+                features['hr_change'] = df['heartRate'].diff().abs().rolling(window_size, min_periods=1).mean()
+
+            if 'rrInterval' in df.columns:
+                # 3. HRV (Standard Deviation of RR intervals) - SDNN
+                # LOW value = High Stress/Aggression
+                # HIGH value = Drowsy/Relaxed
+                features['hrv_sdnn'] = df['rrInterval'].rolling(window_size, min_periods=1).std()
+                
+                # 4. RMSSD (Root Mean Square of Successive Differences)
+                # Better for short windows than SDNN
+                diff_rr = df['rrInterval'].diff()
+                features['hrv_rmssd'] = (diff_rr ** 2).rolling(window_size, min_periods=1).mean() ** 0.5
         
         # Fill NaN values with next or previous valid value.
         # Example: [NaN, 3, 5] -> [3, 3, 5]
         features = features.fillna(method='bfill').fillna(method='ffill').fillna(0)
-        
+        print(f"All Features: {features.columns}")
+
         return features
     
     def generate_labels(self, features):
@@ -111,6 +133,15 @@ class DriverBehaviorClassifier:
             normalize(features['steering_rate']) * 0.15 +
             normalize(features['throttle_changes']) * 0.10
         )
+
+        if self.use_phys:
+            if 'hr_mean' in features.columns:
+                # High Heart Rate + High Variability (erratic) = Aggressive/Stress
+                aggression_score += normalize(features['hr_mean']) * 0.15
+                aggression_score += normalize(features['hr_change']) * 0.10
+
+        if 'short_headway_ratio' in features.columns:
+            aggression_score += normalize(features['short_headway_ratio']) * 0.10
         
         # Add headway if available
         if 'short_headway_ratio' in features.columns:
@@ -130,6 +161,11 @@ class DriverBehaviorClassifier:
         
         if 'eyelid_low_ratio' in features.columns:
             inattention_score += normalize(features['eyelid_low_ratio']) * 0.15
+        
+        if self.use_phys:
+            if 'hrv_rmssd' in features.columns:
+                # High HRV (Relaxed/Drowsy) indicates Inattention
+                inattention_score += normalize(features['hrv_rmssd']) * 0.20
         
         # Low control smoothness indicates inattention.
         inattention_score += normalize(1 - features['control_smoothness']) * 0.10
@@ -244,9 +280,20 @@ if __name__ == "__main__":
     So a HMM will probably perform better.
     """
 
-    default_merge   = execute(interpolation_mode=0)
-    # linear_sync     = execute(interpolation_mode=1)
+    # default_merge   = execute(interpolation_mode=0)
+    linear_sync     = execute(interpolation_mode=1, max_pairs=3)
     # spline_sync     = execute(interpolation_mode=1)
 
+    """
+    print("Merge with Phys")
     classifier = DriverBehaviorClassifier(max_depth=5, min_samples_leaf=5)
     features, labels, results = classifier.run_pipeline(default_merge, window_size=50)
+
+    print("Merge without Phys")
+    classifier = DriverBehaviorClassifier(max_depth=5, min_samples_leaf=5)
+    features, labels, results = classifier.run_pipeline(default_merge, window_size=50, use_pyhs=False)
+    """
+
+    print("Linear with Phys")
+    classifier = DriverBehaviorClassifier(max_depth=5, min_samples_leaf=5)
+    features, labels, results = classifier.run_pipeline(linear_sync, window_size=50)
