@@ -424,26 +424,43 @@ class AnomalyBasedClassifier:
         return self.rf_model.predict_proba(X)
 
 if __name__ == "__main__":
+    import sys
     from DataProcessor import execute
     from LabelGenerator import DriverBehaviorClassifier
     
     print("Loading data...")
-    df = execute(interpolation_mode=1, max_pairs=15, combine_all=True)
-    
-    print("Engineering features...")
-    feature_engineer = DriverBehaviorClassifier()
-    features = feature_engineer.engineer_features(df, window_size=200)
-    
-    model = AnomalyBasedClassifier(
-        contamination=0.2,    # Expect 20% anomalies
-        n_hmm_states=5,        # HMM complexity
-        random_state=42
-    )
-    
-    initial_labels, final_labels, results = model.fit(features)
-    
-    print("\n Model trained successfully!")
+    df = execute(interpolation_mode=1, max_pairs=3, combine_all=True)
+    print("Data loaded.")
+    print(f"Data shape: {df.shape}")
+    print(f"Columns: {df.columns.tolist()}")
 
-    # TODO:
-    # Current Problems:
-    # - Still seems like the model is just memorizing the labeling logic so the train test accuracy is basially the same.
+    if "--save-processed" in sys.argv:
+        print("Flag detected: Processing features and saving to CSV...")
+        feature_engineer = DriverBehaviorClassifier()
+        features = feature_engineer.engineer_features(df, window_size=200)
+        
+        output_file = "processed_data.csv"
+        features.to_csv(output_file, index=False)
+        print(f"Processed data (features) saved to {output_file}")
+        sys.exit(0)
+
+    df.to_csv("processed_data.csv", index=False)
+    
+    if 0 == 1:
+        print("Engineering features...")
+        feature_engineer = DriverBehaviorClassifier()
+        features = feature_engineer.engineer_features(df, window_size=200)
+        
+        model = AnomalyBasedClassifier(
+            contamination=0.2,    # Expect 20% anomalies
+            n_hmm_states=5,        # HMM complexity
+            random_state=42
+        )
+        
+        initial_labels, final_labels, results = model.fit(features)
+        
+        print("\n Model trained successfully!")
+
+        # TODO:
+        # Current Problems:
+        # - Still seems like the model is just memorizing the labeling logic so the train test accuracy is basially the same.
