@@ -1,39 +1,37 @@
 import time
-
-import pandas as pd
-import numpy as np
-import argparse
 import os
+import argparse
+
+import numpy as np
+import pandas as pd
+
+import sys
 
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, cohen_kappa_score
+
 from DriverStateClassifier import DriverStateClassifier
 from AbsoluteThresholdLabeler import AbsoluteThresholdLabeler
 from RFComparison import compare_with_random_forest
+from UnsupervisedComparison import run_gmm
+from data_processing import load_processed_csv, build_processed_from_raw, save_processed_csv
 
-CACHE_PATH = "cache/features_labels_6fb5efcc.csv"
-
-def load_dataset(csv_path, max_rows=None):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Dataset not found: {csv_path}")
-
-    print(f"Loading dataset: {csv_path}")
-    df = pd.read_csv(csv_path, nrows=max_rows)
-
-    labels = df["_label"].values
-    session_ids = df["session_id"].values
-
-    feature_cols = [c for c in df.columns if c not in ("_label", "session_id")]
-    features = df[feature_cols].copy()
-    features["session_id"] = session_ids
-
-    print(f"Samples: {len(df)}")
-    print(f"Features: {len(feature_cols)}")
-
-    return features, labels, session_ids
-
+DEFAULT_CACHE_PATH = os.path.join("cache", "features_labels_full.csv")
 
 def session_train_test_split(features, labels, session_ids, test_size, random_state):
     unique_sessions = np.unique(session_ids)
+
+    # If we only have one session (e.g., after --max-rows truncation), fall back to a plain row-wise split.
+    if len(unique_sessions) < 2:
+        print("Warning: Only one session in data. Falling back to row-wise train/test split.")
+        X_train, X_test, y_train, y_test = train_test_split(
+            features.reset_index(drop=True),
+            labels,
+            test_size=test_size,
+            random_state=random_state,
+            shuffle=True,
+        )
+        return X_train, X_test, y_train, y_test
 
     train_sess, test_sess = train_test_split(unique_sessions, test_size=test_size, random_state=random_state, shuffle=True)
 
@@ -49,7 +47,7 @@ def session_train_test_split(features, labels, session_ids, test_size, random_st
     return X_train, X_test, y_train, y_test
 
 def main():
-    parser = argparse.ArgumentParser("Driver State Classification (CSV-based)")
+    parser = argparse.ArgumentParser("Driver State Classification (RAW or Processed CSV)")
 
     # Evaluation
     parser.add_argument("--eval-mode", choices=["cv", "split"], default="cv")
@@ -58,8 +56,17 @@ def main():
 
     # Misc
     parser.add_argument("--max-rows", type=int, default=None)
-    parser.add_argument("--compare-rf", action="store_true")
+    parser.add_argument("--model-type", choices=["lgbm", "rf", "gmm"], default="lgbm")
+    parser.add_argument("--visualize-clusters", action="store_true", help="Generate cluster visualizations (PCA/t-SNE plots)")
     parser.add_argument("--feature-importance", action="store_true")
+    parser.add_argument("--max-files", type=int, default=None, help="How many raw sessions/files to load when building from RAW.")
+    parser.add_argument("--window-size", type=int, default=50, help="Rolling window size for feature engineering.")
+    parser.add_argument("--interpolation", type=int, default=1, choices=[0, 1, 2], help="Interpolation mode: 0=MERGE, 1=LINEAR, 2=SPLINE")
+
+    # Cache / processed dataset
+    parser.add_argument("--processed-csv", type=str, default=DEFAULT_CACHE_PATH, help="Path to processed CSV (features + labels).")
+    parser.add_argument("--from-raw", action="store_true", help="Run whole data pipeline from raw data.")
+    parser.add_argument("--rebuild-cache", action="store_true", help="Force rebuilding processed CSV from raw data")
 
     # GPU
     parser.add_argument("--use-gpu", action="store_true")
@@ -76,8 +83,23 @@ def main():
     print(f"=> EVALUATION MODE: {args.eval_mode}")
     print("=" * 70)
 
-    # LOAD DATA
-    features, labels, session_ids = load_dataset(CACHE_PATH, max_rows=args.max_rows)
+    # Load Cache or Build Data
+    if args.from_raw or args.rebuild_cache:
+        features, labels, session_ids = build_processed_from_raw(
+            max_files=args.max_files,
+            interpolation_mode=args.interpolation,
+            window_size=args.window_size,
+        )
+        # Optionally limit rows for quick testing AFTER building
+        if args.max_rows is not None and len(features) > args.max_rows:
+            features = features.head(args.max_rows).copy()
+            labels = labels[: args.max_rows]
+            session_ids = session_ids[: args.max_rows]
+
+        save_processed_csv(features, labels, args.processed_csv)
+    else:
+        # Load processed CSV previously saved CSV to speed up the iteration process
+        features, labels, session_ids = load_processed_csv(args.processed_csv, max_rows=args.max_rows)
 
     labeler = AbsoluteThresholdLabeler(use_data_driven_thresholds=True)
 
@@ -86,39 +108,35 @@ def main():
     device = "gpu" if args.use_gpu else "cpu"
     print(f"Device: {device.upper()}")
 
-    classifier = DriverStateClassifier(
-        device=device,
-        gpu_platform_id=args.gpu_platform_id,
-        gpu_device_id=args.gpu_device_id,
-    )
+    classifier = DriverStateClassifier(device=device, gpu_platform_id=args.gpu_platform_id, gpu_device_id=args.gpu_device_id)
     classifier.labeler = labeler
 
     # EVALUATION
-    if args.eval_mode == "cv":
-        print("\nRunning cross-validation...")
-        cv_results = classifier.train_with_cross_validation(features, labels, session_ids)
 
-        if args.compare_rf: compare_with_random_forest(features, labels, session_ids, classifier, cv_results)
+    if args.model_type == "lgbm":
+        if args.eval_mode == "cv":
+            print("\nRunning cross-validation...")
+            classifier.train_with_cross_validation(features, labels, session_ids)
+        else:
+            print("\nRunning session-based train/test split...")
+            X_train, X_test, y_train, y_test = session_train_test_split(features, labels, session_ids, args.test_size, args.random_state)
 
-    else:
-        print("\nRunning session-based train/test split...")
-        X_train, X_test, y_train, y_test = session_train_test_split(features, labels, session_ids, args.test_size, args.random_state)
+            print(f"Train samples: {len(X_train)}")
+            print(f"Test samples : {len(X_test)}")
 
-        print(f"Train samples: {len(X_train)}")
-        print(f"Test samples : {len(X_test)}")
+            classifier.train_and_evaluate(X_train, y_train, X_test, y_test)
 
-        classifier.train_and_evaluate(X_train, y_train, X_test, y_test)
-
-        if args.compare_rf:
-            compare_with_random_forest(X_train, y_train, None, classifier, test_data=(X_test, y_test))
-
-    if args.feature_importance:
-        print("\nFeature importance:")
-        classifier.get_feature_importance(top_n=20)
-
-    print("\n === !!! DONE !!! ===")
-    print("=" * 70)
-
+    elif args.model_type == "rf":
+        print("\nRunning Random Forest...")
+        compare_with_random_forest(features, labels, session_ids, classifier, random_state=args.random_state, test_size=args.test_size)
+    
+    elif args.model_type == "gmm":
+        unsup_results = run_gmm(features, labels, session_ids, classifier, random_state=args.random_state, test_size=args.test_size)
+        
+        if args.visualize_clusters:
+            from UnsupervisedComparison import visualize_clusters
+            print("\nGenerating cluster visualizations...")
+            visualize_clusters(unsup_results, save_dir='plots', max_samples=5000, use_tsne=False)
 
 if __name__ == "__main__":
     start_time = time.perf_counter()
