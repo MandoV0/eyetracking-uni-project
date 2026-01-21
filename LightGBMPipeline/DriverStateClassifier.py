@@ -33,11 +33,10 @@ class DriverStateClassifier:
         Initialize the classifier.
         
         Args:
-            random_state: Random seed for reproducibility
-            verbose: Verbosity level (-1 for silent)
-            device: 'cpu' or 'gpu' (GPU works on both NVIDIA and AMD via OpenCL)
-            gpu_platform_id: OpenCL platform ID (0 = default)
-            gpu_device_id: OpenCL device ID (0 = default)
+            random_state: Random seed to reproduce Model
+            device: 'cpu' or 'gpu'
+            gpu_platform_id: OpenCL platform ID (0 = default), Might be useful if using multiple GPUs
+            gpu_device_id: OpenCL device ID     (0 = default)
         """
         self.random_state = random_state
         
@@ -57,7 +56,7 @@ class DriverStateClassifier:
             'device': device
         }
         
-        # Add GPU-specific parameters if using GPU
+        # GPU params
         if device == 'gpu':
             lgbm_params['gpu_platform_id'] = gpu_platform_id
             lgbm_params['gpu_device_id'] = gpu_device_id
@@ -84,7 +83,7 @@ class DriverStateClassifier:
     def train_with_cross_validation(self, all_features, all_labels, session_ids):
         """
         Train with Leave-One-Session-Out cross-validation.
-        This prevents overfitting to specific driving sessions/drivers.
+        This prevents overfitting to specific drivers and driving session.
         """
         print("\n" + "="*70)
         print("LEAVE-ONE-SESSION-OUT CROSS-VALIDATION")

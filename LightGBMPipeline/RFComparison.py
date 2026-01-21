@@ -1,54 +1,96 @@
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import LeaveOneGroupOut
-from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    cohen_kappa_score,
+)
 
-def compare_with_random_forest(features, labels, session_ids, classifier, cv_results=None, random_state=42):
+
+def compare_with_random_forest(features, labels, session_ids, classifier, random_state=42, test_data=None, test_size=0.2):
+    """
+    Compare Random Forest with LightGBM using a simple train/test split (no CV).
+    
+    Args:
+        features: DataFrame with features (train set)
+        labels: Array with labels (train set)
+        session_ids: Array with session IDs (for session-based split if test_data not provided)
+        classifier: DriverStateClassifier instance (for feature preparation/scaling)
+        random_state: Random seed
+        test_data: Optional tuple (X_test_df, y_test) - if provided, uses this test set
+        test_size: Test set size ratio (used if test_data is None)
+    """
     print("\n" + "="*70)
-    print(" === START: RANDOM FOREST COMPARISON ===")
+    print(" === START: RANDOM FOREST TRAINING ===")
     print("="*70)
     
-    rf_model = RandomForestClassifier(n_estimators=100, max_depth=5, min_samples_split=30, min_samples_leaf=25,
-        max_features='sqrt', random_state=random_state, class_weight='balanced') # Class weight Balance to make sure Model doesnt train on "biased" data.
+    rf_model = RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_split=30, min_samples_leaf=25,
+        max_features='sqrt', random_state=random_state, class_weight='balanced', n_jobs=16)
     
-    # Prepare features using the same scaler as LightGBM
+    # Prepare features using the same feature selection as LightGBM
     X = classifier.prepare_features_for_training(features)
-    
-    # Fit scaler if not already fitted
-    if not hasattr(classifier.scaler, 'mean_') or classifier.scaler.mean_ is None:
-        X_scaled = classifier.scaler.fit_transform(X)
+
+    # If explicit test data provided, use it
+    if test_data is not None:
+        X_test_df, y_test = test_data
+        X_test = classifier.prepare_features_for_training(X_test_df)
+        
+        # Fit
+        X_train_scaled = classifier.scaler.fit_transform(X)
+        X_test_scaled = classifier.scaler.transform(X_test)
+        
+        X_train_final = X_train_scaled
+        y_train_final = labels
+        X_test_final = X_test_scaled
+        y_test_final = y_test
     else:
-        X_scaled = classifier.scaler.transform(X)
-    
-    # Cross-validation
-    logo = LeaveOneGroupOut()
-    rf_train_accs = []
-    rf_test_accs = []
-    
-    for fold_idx, (train_idx, test_idx) in enumerate(logo.split(X_scaled, labels, session_ids)):
-        X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
-        y_train, y_test = labels[train_idx], labels[test_idx]
+        # Do a session-based train/test split
+        if session_ids is None:
+            raise ValueError("RFComparison: Either provide test_data or session_ids for splitting.")
         
-        rf_model.fit(X_train, y_train)
-        train_pred = rf_model.predict(X_train)
-        test_pred = rf_model.predict(X_test)
+        unique_sessions = np.unique(session_ids)
+        train_sessions, test_sessions = train_test_split(
+            unique_sessions, test_size=test_size, random_state=random_state, shuffle=True
+        )
         
-        rf_train_accs.append(accuracy_score(y_train, train_pred))
-        rf_test_accs.append(accuracy_score(y_test, test_pred))
-    
-    print(f"RF Train Accuracy: {np.mean(rf_train_accs):.4f}")
-    print(f"RF Test Accuracy:  {np.mean(rf_test_accs):.4f} ± {np.std(rf_test_accs):.4f}")
-    
-    if cv_results is not None:
-        print(f"\nComparison:")
-        print(f"  LightGBM Train:       {cv_results['mean_train_accuracy']:.4f}")
-        print(f"  LightGBM Test:        {cv_results['mean_test_accuracy']:.4f} ± {cv_results['std_accuracy']:.4f}")
-        print(f"  Random Forest Train:  {np.mean(rf_train_accs):.4f}")
-        print(f"  Random Forest Test:   {np.mean(rf_test_accs):.4f} ± {np.std(rf_test_accs):.4f}")
-        print(f"  Test Difference:      {cv_results['mean_test_accuracy'] - np.mean(rf_test_accs):+.4f}")
-    
-    return {
-        'mean_train_accuracy': np.mean(rf_train_accs),
-        'mean_test_accuracy': np.mean(rf_test_accs),
-        'std_test_accuracy': np.std(rf_test_accs)
-    }
+        train_mask = np.isin(session_ids, train_sessions)
+        test_mask = np.isin(session_ids, test_sessions)
+        
+        X_train_df = features.loc[train_mask].reset_index(drop=True)
+        X_test_df = features.loc[test_mask].reset_index(drop=True)
+        y_train_final = labels[train_mask]
+        y_test_final = labels[test_mask]
+        
+        X_train = classifier.prepare_features_for_training(X_train_df)
+        X_test = classifier.prepare_features_for_training(X_test_df)
+        
+        X_train_scaled = classifier.scaler.fit_transform(X_train)
+        X_test_scaled = classifier.scaler.transform(X_test)
+        
+        X_train_final = X_train_scaled
+        X_test_final = X_test_scaled
+
+    # Train and evaluate RF
+    rf_model.fit(X_train_final, y_train_final)
+    train_pred = rf_model.predict(X_train_final)
+    test_pred = rf_model.predict(X_test_final)
+
+    train_acc = accuracy_score(y_train_final, train_pred)
+    test_acc = accuracy_score(y_test_final, test_pred)
+
+    print(f"RF Train Accuracy: {train_acc:.4f}")
+    print(f"RF Test Accuracy:  {test_acc:.4f}")
+
+    print("\nRF CLASSIFICATION REPORT (test set)")
+    print("-----------------------------------")
+    print(classification_report(y_test_final, test_pred, digits=4))
+
+    print("\nRF CONFUSION MATRIX (test set)")
+    print("------------------------------")
+    cm = confusion_matrix(y_test_final, test_pred)
+    print(cm)
+
+    kappa = cohen_kappa_score(y_test_final, test_pred)
+    print(f"\nRF Cohen's Kappa (test): {kappa:.4f}")
