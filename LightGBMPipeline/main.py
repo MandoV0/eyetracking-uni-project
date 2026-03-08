@@ -15,6 +15,7 @@ from AbsoluteThresholdLabeler import AbsoluteThresholdLabeler
 from RFComparison import compare_with_random_forest
 from UnsupervisedComparison import run_gmm
 from data_processing import load_processed_csv, build_processed_from_raw, save_processed_csv
+import visualize_data
 
 DEFAULT_CACHE_PATH = os.path.join("cache", "features_labels_full.csv")
 
@@ -62,6 +63,7 @@ def main():
     parser.add_argument("--max-files", type=int, default=None, help="How many raw sessions/files to load when building from RAW.")
     parser.add_argument("--window-size", type=int, default=50, help="Rolling window size for feature engineering.")
     parser.add_argument("--interpolation", type=int, default=1, choices=[0, 1, 2], help="Interpolation mode: 0=MERGE, 1=LINEAR, 2=SPLINE")
+    parser.add_argument("--plot", action="store_true", help="Generate plots for Confusion Matrix, Label Distribution and Feature Importance")
 
     # Cache / processed dataset
     parser.add_argument("--processed-csv", type=str, default=DEFAULT_CACHE_PATH, help="Path to processed CSV (features + labels).")
@@ -83,6 +85,11 @@ def main():
     print(f"=> EVALUATION MODE: {args.eval_mode}")
     print("=" * 70)
 
+    # Create plots directory if needed
+    if args.plot:
+        os.makedirs('plots', exist_ok=True)
+        print("Plots will be saved to 'plots/' directory")
+
     # Load Cache or Build Data
     if args.from_raw or args.rebuild_cache:
         features, labels, session_ids = build_processed_from_raw(
@@ -100,6 +107,10 @@ def main():
     else:
         # Load processed CSV previously saved CSV to speed up the iteration process
         features, labels, session_ids = load_processed_csv(args.processed_csv, max_rows=args.max_rows)
+    
+    # Plot label distribution if requested
+    if args.plot:
+        visualize_data.plot_label_distribution(labels, save_dir='plots')
 
     labeler = AbsoluteThresholdLabeler(use_data_driven_thresholds=True)
 
@@ -116,7 +127,13 @@ def main():
     if args.model_type == "lgbm":
         if args.eval_mode == "cv":
             print("\nRunning cross-validation...")
-            classifier.train_with_cross_validation(features, labels, session_ids)
+            results = classifier.train_with_cross_validation(features, labels, session_ids)
+            
+            if args.plot:
+                visualize_data.plot_confusion_matrix(results['true_labels'], results['predictions'], save_dir='plots')
+                # For CV, we use the feature importance from the model trained on the last fold
+                if hasattr(classifier.model, 'feature_importances_'):
+                    visualize_data.plot_feature_importance(classifier.feature_cols, classifier.model.feature_importances_, save_dir='plots')
         else:
             print("\nRunning session-based train/test split...")
             X_train, X_test, y_train, y_test = session_train_test_split(features, labels, session_ids, args.test_size, args.random_state)
@@ -124,11 +141,21 @@ def main():
             print(f"Train samples: {len(X_train)}")
             print(f"Test samples : {len(X_test)}")
 
-            classifier.train_and_evaluate(X_train, y_train, X_test, y_test)
+            y_test_pred = classifier.train_and_evaluate(X_train, y_train, X_test, y_test)
+            
+            if args.plot:
+                visualize_data.plot_confusion_matrix(y_test, y_test_pred, save_dir='plots')
+                if hasattr(classifier.model, 'feature_importances_'):
+                    visualize_data.plot_feature_importance(classifier.feature_cols, classifier.model.feature_importances_, save_dir='plots')
 
     elif args.model_type == "rf":
         print("\nRunning Random Forest...")
-        compare_with_random_forest(features, labels, session_ids, classifier, random_state=args.random_state, test_size=args.test_size)
+        results = compare_with_random_forest(features, labels, session_ids, classifier, random_state=args.random_state, test_size=args.test_size)
+        
+        if args.plot:
+            visualize_data.plot_confusion_matrix(results['y_true'], results['y_pred'], save_dir='plots')
+            if hasattr(results['model'], 'feature_importances_'):
+                visualize_data.plot_feature_importance(results['feature_cols'], results['model'].feature_importances_, save_dir='plots')
     
     elif args.model_type == "gmm":
         unsup_results = run_gmm(features, labels, session_ids, classifier, random_state=args.random_state, test_size=args.test_size)

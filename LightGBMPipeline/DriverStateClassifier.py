@@ -309,3 +309,5 @@ class DriverStateClassifier:
             print()
 
         print(f"\nTest Cohen's Kappa: {cohen_kappa_score(y_test, y_test_pred):.4f}")
+        
+        return y_test_pred

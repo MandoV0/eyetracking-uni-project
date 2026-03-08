@@ -26,8 +26,15 @@ def compare_with_random_forest(features, labels, session_ids, classifier, random
     print(" === START: RANDOM FOREST TRAINING ===")
     print("="*70)
     
-    rf_model = RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_split=30, min_samples_leaf=25,
-        max_features='sqrt', random_state=random_state, class_weight='balanced', n_jobs=16)
+    rf_model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=5,
+        min_samples_split=30,
+        min_samples_leaf=25,
+        max_features='sqrt',
+        random_state=random_state,
+        class_weight='balanced',
+        n_jobs=-1)
     
     # Prepare features using the same feature selection as LightGBM
     X = classifier.prepare_features_for_training(features)
@@ -94,3 +101,10 @@ def compare_with_random_forest(features, labels, session_ids, classifier, random
 
     kappa = cohen_kappa_score(y_test_final, test_pred)
     print(f"\nRF Cohen's Kappa (test): {kappa:.4f}")
+
+    return {
+        'y_true': y_test_final,
+        'y_pred': test_pred,
+        'model': rf_model,
+        'feature_cols': classifier.feature_cols
+    }
