@@ -6,3 +6,6 @@
 **/models
 **/results
 **/plots
+*.pkl
+*.csv
+*.log
