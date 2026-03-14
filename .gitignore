@@ -1,4 +1,7 @@
-**/data/
 .env
+**/data/
 **/tmp
 **/__pycache__
+**/cache
+**/models
+**/results

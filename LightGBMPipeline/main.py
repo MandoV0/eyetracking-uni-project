@@ -22,7 +22,7 @@ DEFAULT_CACHE_PATH = os.path.join("cache", "features_labels_full.csv")
 def session_train_test_split(features, labels, session_ids, test_size, random_state):
     unique_sessions = np.unique(session_ids)
 
-    # If we only have one session (e.g., after --max-rows truncation), fall back to a plain row-wise split.
+    # If we only have one session (ex: after --max-rows truncation), fall back to a plain row-wise split.
     if len(unique_sessions) < 2:
         print("Warning: Only one session in data. Falling back to row-wise train/test split.")
         X_train, X_test, y_train, y_test = train_test_split(
@@ -123,7 +123,6 @@ def main():
     classifier.labeler = labeler
 
     # EVALUATION
-
     if args.model_type == "lgbm":
         if args.eval_mode == "cv":
             print("\nRunning cross-validation...")
